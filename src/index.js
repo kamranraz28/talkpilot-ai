@@ -95,7 +95,7 @@ async function summarizeTranscript(lines) {
   if (clean.length < 2) return null;
   const transcript = clean.slice(0, 120).join('\n');
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-  const prompt = `You are a CRM assistant writing the call note for a call-center agent.\nWrite a professional CRM call note in Bengali for this customer call.\nKeep it concise and natural: only the key purpose and outcome of the call.\nMaximum 1-2 short sentences. No labels, no headers, no unnecessary words, no repetition.\nOutput ONLY the note in Bangla.\n\nTranscript:\n${transcript}`;
+  const prompt = `You are a CRM assistant writing the call note for a call-center agent.\nWrite a professional CRM call note in Bengali for this customer call.\nKeep it concise and natural: only the key purpose and outcome of the call.\nCRITICAL: if the customer scheduled any meeting, next call, next appointment, or next inspection during the call, you MUST include those scheduled details (what + when) in the note — do not drop them.\nMaximum 1-2 short sentences. No labels, no headers, no unnecessary words, no repetition.\nOutput ONLY the note in Bangla.\n\nTranscript:\n${transcript}`;
   const candidates = [
     process.env.NOTE_MODEL,
     'gemini-3.1-flash-lite',
@@ -163,17 +163,31 @@ async function handleCall(channel, args) {
     console.log(`[order] order number context: ${orderNumber}`);
   }
 
+  // API-queued calls carry a customer name — verify it first, then use "Name Sir".
+  let customerName = null;
+  try {
+    const cn = await channel.getChannelVar({ variable: 'CUSTOMER_NAME' });
+    if (cn && cn.value && String(cn.value).trim() !== '') customerName = String(cn.value).trim();
+  } catch (e) {}
+  const nameAddr = customerName
+    ? `CRITICAL NAME RULE: the customer is ${customerName} but DO NOT say or use their name in the opening. First greet, introduce yourself, then politely CONFIRM the name in natural, respectful Bengali — never a blunt "আপনি কি ${customerName}?". Ask naturally instead, e.g. "আপনি কি ${customerName} স্যার বলছিলেন?" or "আমি কি ${customerName} স্যারের সাথে কথা বলছি?". Only AFTER the customer confirms their name, address them as "${customerName} Sir" for the rest of the conversation — never just "Sir" alone, and never before confirmation.`
+    : '';
+  if (customerName) {
+    sysInst += `\n\nCONTEXT: ${nameAddr}`;
+    console.log(`[name] customer name: ${customerName}`);
+  }
+
   // Live transcript lines (caller + agent) collected while Gemini is connected.
   const transcriptLines = [];
 
   const promptGreeting = () => {
     if (orderNumber) {
       // Order-based auto-call: greet → shop name → order number → script.
-      gem.sendText(`You are starting this call now and will speak in Bengali. Open in EXACTLY this order: (1) a warm greeting starting with Assalamu Alaikum, (2) clearly say the shop name "${account?.shop_name || 'our company'}", (3) mention this customer's order number ${orderNumber}. Then continue the conversation following the script below. Do NOT use the generic "আপনি কিভাবে সাহায্য চান" line as the opener.\n\nSCRIPT:\n${perCallScript || 'Speak naturally, briefly and helpfully; find out what the customer needs and help them.'}`);
+      gem.sendText(`You are starting this call now and will speak in Bengali. Open in EXACTLY this order: (1) a warm greeting starting with Assalamu Alaikum, (2) clearly say the shop name "${account?.shop_name || 'our company'}", (3) mention this customer's order number ${orderNumber}. Then continue the conversation following the script below. Do NOT use the generic "আপনি কিভাবে সাহায্য চান" line as the opener.\n\nSCRIPT:\n${perCallScript || 'Speak naturally, briefly and helpfully; find out what the customer needs and help them.'}${nameAddr ? '\n\n'+nameAddr : ''}`);
     } else if (perCallScript) {
-      gem.sendText(`You are starting this outbound call now. Greet briefly and warmly in the caller's language (Bengali), then IMMEDIATELY follow THIS call script for the entire conversation. Do NOT use the generic "How can I help you today / আপনি কিভাবে সাহায্য চান" opening — open according to the script and stay fully natural and non-pushy.\n\nSCRIPT:\n${perCallScript}`);
+      gem.sendText(`You are starting this outbound call now. Greet briefly and warmly in the caller's language (Bengali), then IMMEDIATELY follow THIS call script for the entire conversation. Do NOT use the generic "How can I help you today / আপনি কিভাবে সাহায্য চান" opening — open according to the script and stay fully natural and non-pushy.\n\nSCRIPT:\n${perCallScript}${nameAddr ? '\n\n'+nameAddr : ''}`);
     } else {
-      gem.sendText(`Greet the caller now, out loud, in Bengali. Start the greeting with "Assalamu Alaikum" (আসসালামু আলাইকুম) and keep it short and warm, 1 sentence before the shop name. Introduce the shop "${account?.shop_name || 'our company'}" and then ask "আপনি কিভাবে সাহায্য চান?" (How may I help you today?)`);
+      gem.sendText(`Greet the caller now, out loud, in Bengali. Start the greeting with "Assalamu Alaikum" (আসসালামু আলাইকুম) and keep it short and warm, 1 sentence before the shop name. Introduce the shop "${account?.shop_name || 'our company'}" and then ask "আপনি কিভাবে সাহায্য চান?" (How may I help you today?)${nameAddr ? '\n\n'+nameAddr : ''}`);
     }
   };
 
@@ -311,6 +325,7 @@ async function handleCall(channel, args) {
       formData.append('from', caller);
       formData.append('duration', String(Math.round((Date.now() - t0) / 1000)));
       formData.append('called_at', new Date(t0).toISOString());
+      if (outboundJobId) formData.append('outbound_call_id', String(outboundJobId));
       formData.append('recording', new Blob([fs.readFileSync(mixFile)], { type: 'audio/wav' }), path.basename(mixFile));
       await axios.post(`${LARAVEL_BASE}/api/asterisk/call-status`, formData, {
         headers: { 'X-Asterisk-Token': LARAVEL_TOKEN },
@@ -319,6 +334,24 @@ async function handleCall(channel, args) {
       console.log(`[call-finish] uploaded call_id=${callId}`);
     } catch (e) {
       console.error('[call-finish] failed:', e.message);
+    }
+
+    // Terminal report for an API-queued outbound job: the caller answered and
+    // the AI handled it to completion.
+    if (outboundJobId) {
+      try {
+        await axios.post(`${LARAVEL_BASE}/api/asterisk/outbound-result`, {
+          id: outboundJobId,
+          status: 'completed',
+          channel_id: channel.id,
+        }, {
+          headers: { 'X-Asterisk-Token': LARAVEL_TOKEN },
+          timeout: 20000,
+        });
+        console.log(`[outbound] job=${outboundJobId} completed`);
+      } catch (e) {
+        console.error(`[outbound] completed report failed for job=${outboundJobId}:`, e.message);
+      }
     }
   };
 
@@ -477,7 +510,7 @@ async function main() {
   const app = express();
   app.use(express.json());
   // Originate an AI outbound call via the shop SIP number's outbound endpoint.
-  function originateOutbound(phone, exten, script, jobId, orderNumber) {
+  function originateOutbound(phone, exten, script, jobId, orderNumber, name) {
     const acct = accounts.get(String(exten)) || accounts.get(String(exten).replace(/\D/g, ''));
     if (!acct) return Promise.reject(new Error('unknown exten; no sip account'));
     const opts = {
@@ -491,6 +524,7 @@ async function main() {
     if (script && String(script).trim() !== '') vars.AI_STATUS_SCRIPT = String(script);
     if (jobId) vars.OUTBOUND_JOB_ID = String(jobId);
     if (orderNumber) vars.ORDER_NUMBER = String(orderNumber);
+    if (name && String(name).trim() !== '') vars.CUSTOMER_NAME = String(name).trim();
     if (Object.keys(vars).length > 0) opts.variables = vars;
     return ariClient.channels.originate(opts);
   }
@@ -512,30 +546,69 @@ async function main() {
       });
       const jobs = Array.isArray(data) ? data : (data.data || []);
       for (const job of jobs) {
-        const report = (status, extra = {}) =>
-          axios.post(`${LARAVEL_BASE}/api/asterisk/outbound-result`, {
-            id: job.id, status, ...extra,
-          }, { headers: { 'X-Asterisk-Token': LARAVEL_TOKEN }, timeout: 30000 })
-            .catch(e => console.error(`[outbound] result report job=${job.id} failed:`, e.message));
-        try {
-          const ch = await originateOutbound(String(job.phone || ''), String(job.exten || ''), job.script, job.id, job.order_number);
-          console.log(`[outbound] job=${job.id} originated ${ch.id} to ${job.phone} via ${job.exten}`);
-          await report('completed', { channel_id: ch.id });
-        } catch (e) {
-          console.error(`[outbound] job=${job.id} (${job.phone} via ${job.exten}) failed:`, e.message);
-          if (String(e.message).includes('unknown exten')) {
-            // Definitive config problem — mark failed so it isn't retried forever.
-            await report('failed', { error: String(e.message).slice(0, 500) });
-          } else {
-            // Transient (Asterisk down / network): leave it to be reclaimed by
-            // the portal (dispatched + no channel_id > 3 min → re-opened) and
-            // retried on a later poll. Never lose the call.
-            console.error(`[outbound] job=${job.id} is a TRANSIENT failure — left for automatic retry`);
-          }
-        }
+        // Fire-and-forget so multiple jobs can ring in parallel; the ARI dial
+        // timeout (45s) would otherwise serialize the whole queue.
+        runOutboundJob(job).catch(e => console.error(`[outbound] job=${job.id} task error:`, e.message));
       }
     } catch (e) {
       console.error('[outbound] poll error:', e.message);
+    }
+  }
+
+  async function runOutboundJob(job) {
+    const report = (status, extra = {}) =>
+      axios.post(`${LARAVEL_BASE}/api/asterisk/outbound-result`, {
+        id: job.id, status, ...extra,
+      }, { headers: { 'X-Asterisk-Token': LARAVEL_TOKEN }, timeout: 20000 })
+        .catch(e => console.error(`[outbound] result report job=${job.id} (${status}) failed:`, e.message));
+
+    let ch;
+    try {
+      ch = await originateOutbound(String(job.phone || ''), String(job.exten || ''), job.script, job.id, job.order_number, job.name);
+      console.log(`[outbound] job=${job.id} originated ${ch.id} to ${job.phone} via ${job.exten}`);
+    } catch (e) {
+      console.error(`[outbound] job=${job.id} (${job.phone} via ${job.exten}) failed:`, e.message);
+      if (String(e.message).includes('unknown exten')) {
+        // Definitive config problem — mark failed so it isn't retried forever.
+        await report('failed', { error: String(e.message).slice(0, 500) });
+      } else {
+        // Transient (Asterisk down / network): leave it to be reclaimed by
+        // the portal (dispatched + no channel_id > 3 min → re-opened) and
+        // retried on a later poll. Never lose the call.
+        console.error(`[outbound] job=${job.id} is a TRANSIENT failure — left for automatic retry`);
+      }
+      return;
+    }
+
+    // Mark the ring as in-progress with its channel so the portal's reclaim
+    // sweep never re-dials it while the first leg is still ringing.
+    const chId = String(ch.id);
+    await report('dispatched', { channel_id: chId });
+
+    // The call is "answered" the moment the originated channel enters Stasis
+    // (handleCall runs). Anything else before the dial timeout is "missed".
+    let answered = false;
+    const onStasis = (event, eventChannel) => {
+      if (eventChannel && String(eventChannel.id) === chId) {
+        answered = true;
+        ariClient.removeListener('StasisStart', onStasis);
+      }
+    };
+    ariClient.on('StasisStart', onStasis);
+
+    const deadline = Date.now() + 45 * 1000 + 10000; // originate timeout + grace
+    while (!answered && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    ariClient.removeListener('StasisStart', onStasis);
+
+    if (answered) {
+      console.log(`[outbound] job=${job.id} answered by ${job.phone}`);
+      await report('answered', { channel_id: chId });
+      // Final "completed" is reported by handleCall.finish on StasisEnd.
+    } else {
+      console.log(`[outbound] job=${job.id} NOT answered in time — reporting missed`);
+      await report('missed', { error: 'no answer' });
     }
   }
 
